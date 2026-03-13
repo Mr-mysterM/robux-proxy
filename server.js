@@ -8,12 +8,9 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Stockage en mémoire des snapshots de minuit
-// { "groupId_cookie_hash": { date: "2026-03-13", pendingRobux: 140 } }
 const midnightSnapshots = {};
 
 function hashKey(id, type, cookie) {
-  // Clé simple basée sur l'id et les 20 derniers caractères du cookie
   return `${type}_${id}_${cookie.slice(-20)}`;
 }
 
@@ -29,29 +26,6 @@ const getRobloxHeaders = (cookie) => ({
   'Accept': 'application/json',
 });
 
-async function fetchRevenueSummary(type, id, cookie) {
-  const headers = getRobloxHeaders(cookie);
-  const base = `https://apis.roblox.com/transaction-records/v1/${type}s/${id}/revenue/summary`;
-
-  const [dayRes, monthRes] = await Promise.all([
-    fetch(`${base}/day`, { headers }),
-    fetch(`${base}/month`, { headers }),
-  ]);
-
-  const dayData = await dayRes.json();
-  const monthData = await monthRes.json();
-
-  return { dayData, monthData };
-}
-
-function calcDayRobux(dayData, snapshotPending) {
-  const currentPending = dayData.pendingRobux ?? 0;
-  const itemSale = dayData.itemSaleRobux ?? 0;
-  // Si on a un snapshot, le vrai revenu du jour = différence de pending + ventes directes
-  const pendingDiff = Math.max(0, currentPending - snapshotPending);
-  return pendingDiff + itemSale;
-}
-
 // Route groupe
 app.get('/group/:groupId/revenue', async (req, res) => {
   const cookie = req.headers['x-roblox-cookie'];
@@ -59,7 +33,16 @@ app.get('/group/:groupId/revenue', async (req, res) => {
   if (!cookie) return res.status(400).json({ error: 'Cookie manquant' });
 
   try {
-    const { dayData, monthData } = await fetchRevenueSummary('group', groupId, cookie);
+    const headers = getRobloxHeaders(cookie);
+    const base = `https://apis.roblox.com/transaction-records/v1/groups/${groupId}/revenue/summary`;
+
+    const [dayRes, monthRes] = await Promise.all([
+      fetch(`${base}/day`, { headers }),
+      fetch(`${base}/month`, { headers }),
+    ]);
+
+    const dayData = await dayRes.json();
+    const monthData = await monthRes.json();
 
     if (dayData.errors || monthData.errors) {
       return res.status(400).json({ error: `Roblox API: ${JSON.stringify(dayData.errors || monthData.errors)}` });
@@ -68,26 +51,16 @@ app.get('/group/:groupId/revenue', async (req, res) => {
     const key = hashKey(groupId, 'group', cookie);
     const today = getTodayStr();
 
-    // Si pas de snapshot pour aujourd'hui, on en crée un
     if (!midnightSnapshots[key] || midnightSnapshots[key].date !== today) {
-      midnightSnapshots[key] = {
-        date: today,
-        pendingRobux: dayData.pendingRobux ?? 0,
-      };
+      midnightSnapshots[key] = { date: today, pendingRobux: dayData.pendingRobux ?? 0 };
     }
 
     const snapshotPending = midnightSnapshots[key].pendingRobux;
-    const dayRobux = calcDayRobux(dayData, snapshotPending);
+    const currentPending = dayData.pendingRobux ?? 0;
+    const dayRobux = Math.max(0, currentPending - snapshotPending) + (dayData.itemSaleRobux ?? 0);
     const monthRobux = (monthData.pendingRobux ?? 0) + (monthData.itemSaleRobux ?? 0);
 
-    res.json({
-      dayRobux,
-      dayCount: 0,
-      monthRobux,
-      monthCount: 0,
-      dayData,
-      monthData,
-    });
+    res.json({ dayRobux, dayCount: 0, monthRobux, monthCount: 0 });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -100,7 +73,15 @@ app.get('/player/:userId/revenue', async (req, res) => {
   if (!cookie) return res.status(400).json({ error: 'Cookie manquant' });
 
   try {
-    const { dayData, monthData } = await fetchRevenueSummary('user', userId, cookie);
+    const headers = getRobloxHeaders(cookie);
+
+    const [dayRes, monthRes] = await Promise.all([
+      fetch(`https://apis.roblox.com/transaction-records/v1/users/${userId}/transaction-totals?timeFrame=Day&transactionType=summary`, { headers }),
+      fetch(`https://apis.roblox.com/transaction-records/v1/users/${userId}/transaction-totals?timeFrame=Month&transactionType=summary`, { headers }),
+    ]);
+
+    const dayData = await dayRes.json();
+    const monthData = await monthRes.json();
 
     if (dayData.errors || monthData.errors) {
       return res.status(400).json({ error: `Roblox API: ${JSON.stringify(dayData.errors || monthData.errors)}` });
@@ -110,36 +91,18 @@ app.get('/player/:userId/revenue', async (req, res) => {
     const today = getTodayStr();
 
     if (!midnightSnapshots[key] || midnightSnapshots[key].date !== today) {
-      midnightSnapshots[key] = {
-        date: today,
-        pendingRobux: dayData.pendingRobux ?? 0,
-      };
+      midnightSnapshots[key] = { date: today, salesTotal: dayData.salesTotal ?? 0 };
     }
 
-    const snapshotPending = midnightSnapshots[key].pendingRobux;
-    const dayRobux = calcDayRobux(dayData, snapshotPending);
-    const monthRobux = (monthData.pendingRobux ?? 0) + (monthData.itemSaleRobux ?? 0);
+    const snapshotSales = midnightSnapshots[key].salesTotal ?? 0;
+    const currentSales = dayData.salesTotal ?? 0;
+    const dayRobux = Math.max(0, currentSales - snapshotSales);
+    const monthRobux = monthData.salesTotal ?? 0;
 
-    res.json({
-      dayRobux,
-      dayCount: 0,
-      monthRobux,
-      monthCount: 0,
-      dayData,
-      monthData,
-    });
+    res.json({ dayRobux, dayCount: 0, monthRobux, monthCount: 0 });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-});
-
-// Route pour réinitialiser le snapshot (à appeler à minuit)
-app.post('/reset-snapshot', (req, res) => {
-  const key = req.body.key;
-  if (key && midnightSnapshots[key]) {
-    delete midnightSnapshots[key];
-  }
-  res.json({ ok: true });
 });
 
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
